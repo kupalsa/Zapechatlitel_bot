@@ -197,39 +197,47 @@ function getMessageDateTime(message) {
 
 // ---------- Список существующих категорий-баз ----------
 
-async function listCategoryDatabases() {
+async function listChildDatabases() {
   if (!NOTION_PARENT_PAGE_ID) return [];
 
-  const resp = await fetch("https://api.notion.com/v1/search", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${NOTION_API_KEY}`,
-      "Notion-Version": NOTION_VERSION,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      query: "Life Log —",
-      filter: { property: "object", value: "database" },
-      page_size: 50,
-    }),
-  });
-
-  if (!resp.ok) return [];
-
-  const data = await resp.json();
-  const normalizedParent = NOTION_PARENT_PAGE_ID.replace(/-/g, "");
   const results = [];
+  let cursor = undefined;
 
-  for (const db of data.results || []) {
-    const title = (db.title || []).map((t) => t.plain_text).join("");
-    const parentId = db.parent && db.parent.page_id ? db.parent.page_id.replace(/-/g, "") : null;
+  do {
+    const url = new URL(`https://api.notion.com/v1/blocks/${NOTION_PARENT_PAGE_ID}/children`);
+    url.searchParams.set("page_size", "100");
+    if (cursor) url.searchParams.set("start_cursor", cursor);
 
-    if (parentId === normalizedParent && title.startsWith("Life Log — ")) {
-      results.push({ category: title.replace("Life Log — ", ""), databaseId: db.id });
+    const resp = await fetch(url.toString(), {
+      headers: {
+        Authorization: `Bearer ${NOTION_API_KEY}`,
+        "Notion-Version": NOTION_VERSION,
+      },
+    });
+
+    if (!resp.ok) {
+      console.error("Notion listChildren failed:", resp.status, await resp.text());
+      break;
     }
-  }
+
+    const data = await resp.json();
+    for (const block of data.results || []) {
+      if (block.type === "child_database") {
+        results.push({ id: block.id, title: block.child_database.title || "" });
+      }
+    }
+
+    cursor = data.has_more ? data.next_cursor : undefined;
+  } while (cursor);
 
   return results;
+}
+
+async function listCategoryDatabases() {
+  const children = await listChildDatabases();
+  return children
+    .filter((db) => db.title.startsWith("Life Log — "))
+    .map((db) => ({ category: db.title.replace("Life Log — ", ""), databaseId: db.id }));
 }
 
 async function resolveDatabaseForCategory(category) {
@@ -531,31 +539,9 @@ async function performSplit(category, chatId) {
 // ---------- Bot State (хранение незавершённых предложений) ----------
 
 async function getOrCreateBotStateDb() {
-  const resp = await fetch("https://api.notion.com/v1/search", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${NOTION_API_KEY}`,
-      "Notion-Version": NOTION_VERSION,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      query: "Bot State",
-      filter: { property: "object", value: "database" },
-      page_size: 10,
-    }),
-  });
-
-  if (resp.ok) {
-    const data = await resp.json();
-    const normalizedParent = NOTION_PARENT_PAGE_ID.replace(/-/g, "");
-    for (const db of data.results || []) {
-      const title = (db.title || []).map((t) => t.plain_text).join("");
-      const parentId = db.parent && db.parent.page_id ? db.parent.page_id.replace(/-/g, "") : null;
-      if (title === "Bot State" && parentId === normalizedParent) {
-        return db.id;
-      }
-    }
-  }
+  const children = await listChildDatabases();
+  const existing = children.find((db) => db.title === "Bot State");
+  if (existing) return existing.id;
 
   const createResp = await fetch("https://api.notion.com/v1/databases", {
     method: "POST",
