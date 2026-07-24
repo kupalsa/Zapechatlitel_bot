@@ -1,29 +1,30 @@
 // api/webhook.js
 //
-// Telegram-бот: принимает свободный текст. Для каждой темы (категории)
-// сообщений заводится отдельная Notion-база. Если сообщение относится к уже
-// существующей категории — бот сам находит нужную базу и сохраняет запись.
-// Если это новая тема — бот предлагает название категории и список полей,
-// ждёт подтверждения (или правки) следующим сообщением, и только после
-// подтверждения создаёт базу и сохраняет запись.
+// Telegram bot: accepts free-form text. Each topic (category) gets its own
+// Notion database. If a message belongs to an existing category, the bot finds
+// the right database and saves the entry. If it's a new topic, the bot proposes
+// a category name and field list, waits for confirmation (or corrections), and
+// only then creates the database and saves the entry.
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-flash-latest";
 const NOTION_API_KEY = process.env.NOTION_API_KEY;
-const NOTION_DATABASE_ID = process.env.NOTION_DATABASE_ID; // старая общая база (архив/для ручного разделения)
+const NOTION_DATABASE_ID = process.env.NOTION_DATABASE_ID; // legacy shared database
 const NOTION_PARENT_PAGE_ID = process.env.NOTION_PARENT_PAGE_ID;
 const TIMEZONE = "Asia/Jerusalem";
 const NOTION_VERSION = "2022-06-28";
 
 const ALLOWED_TYPES = ["text", "number", "date", "select"];
 
-// ВАЖНО: не используем \b — в JS граница слова определяется через ASCII \w,
-// поэтому после кириллического слова ("да") она не срабатывает.
-// Подтверждением считаем только сообщение, целиком состоящее из слова согласия,
-// чтобы "да, но добавь поле X" корректно уходило в правку.
-const CONFIRM_RE = /^\s*(да|ага|угу|ок|окей|хорошо|подтверждаю|подтверждай|создавай|создай|го|давай|конечно|верно|всё верно|все верно|yes|ok|okay|confirm)\s*[!.]*\s*$/i;
-const CANCEL_RE = /^\s*(нет|неа|отмена|отменить|не надо|не нужно|стоп|cancel|no|stop)\s*[!.]*\s*$/i;
+// Core fields every category database gets automatically.
+const CORE_FIELDS = ["Name", "Logged Date", "Logged Time", "Event Date", "Event Time", "Category", "Type", "Note"];
+
+// NOTE: no \b here — in JS word boundaries are ASCII-based, so they fail after
+// Cyrillic words. Confirmation must be the whole message, so that
+// "yes, but add a field" is treated as a correction instead.
+const CONFIRM_RE = /^\s*(yes|yep|yeah|ok|okay|sure|confirm|correct|create|go|да|ага|ок|окей|хорошо|создавай)\s*[!.]*\s*$/i;
+const CANCEL_RE = /^\s*(no|nope|cancel|stop|нет|отмена|стоп)\s*[!.]*\s*$/i;
 
 module.exports = async (req, res) => {
   if (req.method !== "POST") {
@@ -46,16 +47,15 @@ module.exports = async (req, res) => {
     if (userText.startsWith("/start")) {
       await sendTelegramMessage(
         chatId,
-        "Привет! Пиши мне свободным текстом, что сделал.\n\n" +
-          "Если тема новая — я предложу, какую базу и поля под неё завести, и подожду твоего подтверждения.\n" +
-          "Если тема уже знакомая — сразу сохраню запись в нужную базу.\n\n" +
-          "Ещё есть ручная команда: «раздели <категория>» — перенесёт записи с таким значением поля «Категория» из старой общей базы в отдельную."
+        "Hi! Just write freely about what you did.\n\n" +
+          "If the topic is new, I'll propose a database and fields for it and wait for your confirmation.\n" +
+          "If the topic already exists, I'll save the entry right away.\n\n" +
+          "Manual command: \"split <category>\" — moves entries with that Category value out of the legacy shared database into a dedicated one."
       );
       res.status(200).json({ ok: true });
       return;
     }
 
-    // Команда на разделение старой общей базы (ручной сценарий, категория — любой текст)
     const splitCategory = parseSplitCommand(userText);
     if (splitCategory) {
       await performSplit(splitCategory, chatId);
@@ -63,33 +63,28 @@ module.exports = async (req, res) => {
       return;
     }
 
-    const { date: defaultDate, time: defaultTime } = getMessageDateTime(message);
+    const { date: loggedDate, time: loggedTime } = getMessageDateTime(message);
 
-    // Есть ли незавершённое предложение по новой категории для этого чата?
     const pending = await getPendingProposal(chatId);
-
     if (pending) {
-      await handlePendingResponse(pending, userText, chatId, defaultDate, defaultTime);
+      await handlePendingResponse(pending, userText, chatId, loggedDate, loggedTime);
       res.status(200).json({ ok: true });
       return;
     }
 
-    // Обычный поток: определяем, существующая это категория или новая
     const existingCategories = await listCategoryDatabases();
     const classification = await classifyOrProposeCategory(userText, existingCategories);
 
     if (classification.existing_category) {
       const match = existingCategories.find((c) => c.category === classification.existing_category);
       if (match) {
-        await logAndSaveEntry(userText, match.category, match.databaseId, defaultDate, defaultTime, chatId);
+        await saveEntry(userText, match.category, match.databaseId, loggedDate, loggedTime, chatId);
         res.status(200).json({ ok: true });
         return;
       }
-      // Модель сослалась на категорию, которой на самом деле нет в списке — считаем новой
     }
 
-    // Новая категория — предлагаем структуру и ждём подтверждения
-    const category = classification.new_category || classification.existing_category || "Другое";
+    const category = classification.new_category || classification.existing_category || "Other";
     const fields = classification.fields || [];
 
     await setPendingProposal(chatId, category, fields, userText);
@@ -102,24 +97,23 @@ module.exports = async (req, res) => {
   }
 };
 
-// ---------- Обработка ответа на предложение новой категории ----------
+// ---------- Pending proposal flow ----------
 
-async function handlePendingResponse(pending, userText, chatId, defaultDate, defaultTime) {
+async function handlePendingResponse(pending, userText, chatId, loggedDate, loggedTime) {
   if (CONFIRM_RE.test(userText)) {
     const databaseId = await createCategoryDatabase(pending.category, pending.fields);
     await clearPendingProposal(chatId);
-    await sendTelegramMessage(chatId, `✅ Создал базу «${pending.category}». Сохраняю запись...`);
-    await logAndSaveEntry(pending.originalText, pending.category, databaseId, defaultDate, defaultTime, chatId);
+    await sendTelegramMessage(chatId, `✅ Created database "${pending.category}". Saving the entry...`);
+    await saveEntry(pending.originalText, pending.category, databaseId, loggedDate, loggedTime, chatId);
     return;
   }
 
   if (CANCEL_RE.test(userText)) {
     await clearPendingProposal(chatId);
-    await sendTelegramMessage(chatId, "Ок, не создаю. Напиши сообщение заново, если передумаешь.");
+    await sendTelegramMessage(chatId, "Okay, not creating it. Send the message again whenever you want.");
     return;
   }
 
-  // Считаем это правкой предложенной структуры
   const revised = await reviseProposal(pending.category, pending.fields, userText);
   await setPendingProposal(chatId, revised.category, revised.fields, pending.originalText);
   await sendTelegramMessage(chatId, buildProposalText(revised.category, revised.fields, true));
@@ -128,36 +122,36 @@ async function handlePendingResponse(pending, userText, chatId, defaultDate, def
 function buildProposalText(category, fields, isRevision) {
   const lines = [
     isRevision
-      ? `Обновил предложение. Новая категория: «${category}»`
-      : `У тебя ещё нет базы для темы «${category}». Предлагаю такие доп. поля:`,
+      ? `Updated proposal. Category: "${category}"`
+      : `You don't have a database for "${category}" yet. Suggested extra fields:`,
   ];
 
-  if (fields.length === 0) {
-    lines.push("(доп. полей не требуется — только стандартные)");
+  if (!fields || fields.length === 0) {
+    lines.push("(no extra fields needed — core fields only)");
   } else {
     for (const f of fields) {
       lines.push(`• ${f.name} (${f.type})`);
     }
   }
 
-  lines.push("(Дата, Время и Категория добавятся автоматически)");
-  lines.push('\nВсё верно? Напиши "да" чтобы создать, или опиши, что поправить.');
+  lines.push("(Logged Date/Time, Event Date/Time, Category, Type and Note are added automatically)");
+  lines.push('\nLooks right? Reply "yes" to create it, or tell me what to change.');
 
   return lines.join("\n");
 }
 
-// ---------- Логирование обычной записи в конкретную базу ----------
+// ---------- Saving an entry ----------
 
-async function logAndSaveEntry(userText, category, targetDatabaseId, defaultDate, defaultTime, chatId) {
+async function saveEntry(userText, category, targetDatabaseId, loggedDate, loggedTime, chatId) {
   const { schema, selectOptions } = await getNotionSchemaAndOptions(targetDatabaseId);
-  const existingTitles = await getExistingTitles(targetDatabaseId);
+  const existingTypes = selectOptions["Type"] || [];
 
   const parsed = await parseWithGemini(userText, {
     schema,
     selectOptions,
-    existingTitles,
-    defaultDate,
-    defaultTime,
+    existingTypes,
+    loggedDate,
+    loggedTime,
     category,
   });
 
@@ -180,13 +174,14 @@ async function logAndSaveEntry(userText, category, targetDatabaseId, defaultDate
     await addPropertiesToDatabase(propsToAdd, schema, targetDatabaseId);
   }
 
-  await createNotionPage(parsed, targetDatabaseId);
+  // Name is always the raw message, so the original wording is never lost.
+  parsed.title = userText;
 
-  const summary = buildConfirmationText(parsed, category);
-  await sendTelegramMessage(chatId, summary);
+  await createNotionPage(parsed, targetDatabaseId);
+  await sendTelegramMessage(chatId, buildConfirmationText(parsed, category));
 }
 
-// ---------- Время сообщения ----------
+// ---------- Message timestamp ----------
 
 function getMessageDateTime(message) {
   const d = new Date(message.date * 1000);
@@ -199,7 +194,7 @@ function getMessageDateTime(message) {
   return { date, time };
 }
 
-// ---------- Список существующих категорий-баз ----------
+// ---------- Listing child databases (immediate, unlike search API) ----------
 
 async function listChildDatabases() {
   if (!NOTION_PARENT_PAGE_ID) return [];
@@ -250,7 +245,7 @@ async function resolveDatabaseForCategory(category) {
   return match ? match.databaseId : null;
 }
 
-// ---------- Notion: схема / варианты / названия ----------
+// ---------- Notion: schema ----------
 
 async function getNotionSchemaAndOptions(databaseId) {
   const resp = await fetch(`https://api.notion.com/v1/databases/${databaseId}`, {
@@ -285,35 +280,6 @@ function mapNotionTypeToSimple(notionType) {
   if (notionType === "select") return "select";
   return "text";
 }
-
-async function getExistingTitles(databaseId, limit = 50) {
-  const resp = await fetch(`https://api.notion.com/v1/databases/${databaseId}/query`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${NOTION_API_KEY}`,
-      "Notion-Version": NOTION_VERSION,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ page_size: limit }),
-  });
-
-  if (!resp.ok) return [];
-
-  const data = await resp.json();
-  const titles = new Set();
-
-  for (const page of data.results || []) {
-    const nameProp = page.properties && page.properties.Name;
-    if (nameProp && nameProp.title) {
-      const text = nameProp.title.map((t) => t.plain_text).join("").trim();
-      if (text) titles.add(text);
-    }
-  }
-
-  return Array.from(titles);
-}
-
-// ---------- Notion: изменение схемы ----------
 
 async function addPropertiesToDatabase(newProperties, existingSchema, databaseId) {
   const propertiesPatch = {};
@@ -355,14 +321,18 @@ function buildNotionPropertySchema(type, options) {
   }
 }
 
-// ---------- Notion: создание новой базы под категорию ----------
+// ---------- Notion: create category database ----------
 
 async function createCategoryDatabase(category, extraFields) {
   const properties = {
     Name: { title: {} },
-    Дата: buildNotionPropertySchema("date"),
-    Время: buildNotionPropertySchema("text"),
-    Категория: buildNotionPropertySchema("select", [category]),
+    "Logged Date": buildNotionPropertySchema("date"),
+    "Logged Time": buildNotionPropertySchema("text"),
+    "Event Date": buildNotionPropertySchema("date"),
+    "Event Time": buildNotionPropertySchema("text"),
+    Category: buildNotionPropertySchema("select", [category]),
+    Type: buildNotionPropertySchema("select"),
+    Note: buildNotionPropertySchema("text"),
   };
 
   for (const f of extraFields || []) {
@@ -393,15 +363,16 @@ async function createCategoryDatabase(category, extraFields) {
   return data.id;
 }
 
-// ---------- Notion: запись ----------
+// ---------- Notion: pages ----------
 
 async function createNotionPage(parsed, databaseId) {
   const properties = {
-    Name: { title: [{ text: { content: parsed.title || "Запись" } }] },
+    Name: { title: [{ text: { content: (parsed.title || "Entry").slice(0, 1900) } }] },
   };
 
   for (const [name, field] of Object.entries(parsed.properties || {})) {
     if (!ALLOWED_TYPES.includes(field.type)) continue;
+    if (field.value === null || field.value === undefined || field.value === "") continue;
     properties[name] = buildNotionPropertyValue(field.type, field.value);
   }
 
@@ -427,12 +398,12 @@ function buildNotionPropertyValue(type, value) {
     case "number":
       return { number: typeof value === "number" ? value : parseFloat(value) || null };
     case "date":
-      return { date: value ? { start: value } : null };
+      return { date: { start: value } };
     case "select":
-      return { select: value ? { name: String(value) } : null };
+      return { select: { name: String(value).slice(0, 90) } };
     case "text":
     default:
-      return { rich_text: [{ text: { content: String(value ?? "") } }] };
+      return { rich_text: [{ text: { content: String(value).slice(0, 1900) } }] };
   }
 }
 
@@ -453,34 +424,34 @@ function extractSimpleValue(prop) {
   }
 }
 
-// ---------- Ручное разделение старой общей базы ----------
+// ---------- Manual split of the legacy shared database ----------
 
 function parseSplitCommand(text) {
-  const m = text.match(/^(раздели|вынеси|перенеси)\s+(.+)/i);
+  const m = text.match(/^(split|move|раздели|вынеси|перенеси)\s+(.+)/i);
   if (!m) return null;
   return m[2].trim();
 }
 
 async function performSplit(category, chatId) {
   if (!NOTION_PARENT_PAGE_ID || !NOTION_DATABASE_ID) {
-    await sendTelegramMessage(chatId, "Не настроены NOTION_PARENT_PAGE_ID / NOTION_DATABASE_ID.");
+    await sendTelegramMessage(chatId, "NOTION_PARENT_PAGE_ID / NOTION_DATABASE_ID are not configured.");
     return;
   }
 
   const existingDbId = await resolveDatabaseForCategory(category);
   if (existingDbId) {
-    await sendTelegramMessage(chatId, `База для «${category}» уже есть, новые записи и так пишутся туда.`);
+    await sendTelegramMessage(chatId, `A database for "${category}" already exists — new entries go there already.`);
     return;
   }
 
-  await sendTelegramMessage(chatId, `Ищу записи «${category}» в старой базе и переношу...`);
+  await sendTelegramMessage(chatId, `Looking for "${category}" entries in the legacy database and moving them...`);
 
-  const { schema, selectOptions } = await getNotionSchemaAndOptions(NOTION_DATABASE_ID);
+  const { schema } = await getNotionSchemaAndOptions(NOTION_DATABASE_ID);
   const extraFields = Object.entries(schema)
-    .filter(([name]) => !["Name", "Дата", "Время", "Категория"].includes(name))
+    .filter(([name]) => !CORE_FIELDS.includes(name))
     .map(([name, type]) => ({ name, type }));
 
-  const newDbId = await createCategoryDatabase(category, extraFields.length > 0 ? extraFields : []);
+  const newDbId = await createCategoryDatabase(category, extraFields);
 
   let allPages = [];
   let cursor = undefined;
@@ -493,7 +464,7 @@ async function performSplit(category, chatId) {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        filter: { property: "Категория", select: { equals: category } },
+        filter: { property: "Category", select: { equals: category } },
         start_cursor: cursor,
         page_size: 100,
       }),
@@ -508,13 +479,13 @@ async function performSplit(category, chatId) {
   let moved = 0;
   for (const page of allPages) {
     const properties = {};
-    let title = "Запись";
+    let title = "Entry";
 
     for (const [name, prop] of Object.entries(page.properties)) {
       const simple = extractSimpleValue(prop);
       if (!simple) continue;
       if (name === "Name") {
-        title = simple.value || "Запись";
+        title = simple.value || "Entry";
       } else {
         properties[name] = simple;
       }
@@ -533,14 +504,14 @@ async function performSplit(category, chatId) {
       });
       moved++;
     } catch (e) {
-      console.error("Ошибка переноса записи:", e);
+      console.error("Failed to move entry:", e);
     }
   }
 
-  await sendTelegramMessage(chatId, `✅ Перенёс ${moved} записей категории «${category}» в новую базу.`);
+  await sendTelegramMessage(chatId, `✅ Moved ${moved} "${category}" entries into the new database.`);
 }
 
-// ---------- Bot State (хранение незавершённых предложений) ----------
+// ---------- Bot State (pending proposals) ----------
 
 async function getOrCreateBotStateDb() {
   const children = await listChildDatabases();
@@ -595,9 +566,11 @@ async function getPendingProposal(chatId) {
   const page = (data.results || [])[0];
   if (!page) return null;
 
-  const category = (page.properties.Category.rich_text || []).map((t) => t.plain_text).join("");
-  const fieldsJson = (page.properties.FieldsJson.rich_text || []).map((t) => t.plain_text).join("");
-  const originalText = (page.properties.OriginalText.rich_text || []).map((t) => t.plain_text).join("");
+  const readText = (prop) => (prop && prop.rich_text ? prop.rich_text.map((t) => t.plain_text).join("") : "");
+
+  const category = readText(page.properties.Category);
+  const fieldsJson = readText(page.properties.FieldsJson);
+  const originalText = readText(page.properties.OriginalText);
 
   let fields = [];
   try {
@@ -684,89 +657,95 @@ async function generateGeminiJSON(prompt) {
   try {
     return JSON.parse(cleaned);
   } catch (e) {
-    throw new Error(`Не удалось распарсить ответ Gemini как JSON: ${cleaned}`);
+    throw new Error(`Failed to parse Gemini response as JSON: ${cleaned}`);
   }
 }
 
 async function classifyOrProposeCategory(userText, existingCategories) {
   const categoryNames = existingCategories.map((c) => c.category);
-  const listText = categoryNames.length > 0 ? categoryNames.join(", ") : "(пока нет ни одной)";
+  const listText = categoryNames.length > 0 ? categoryNames.join(", ") : "(none yet)";
 
-  const prompt = `У пользователя уже есть отдельные базы под такие категории: ${listText}.
+  const prompt = `The user already has separate databases for these categories: ${listText}.
 
-Проанализируй сообщение пользователя и реши:
-1. Если оно явно относится к одной из существующих категорий — верни {"existing_category": "<точное имя из списка>"}.
-2. Если это новый тип записи, для которого пока нет подходящей категории — предложи короткое название категории (без цифр, в том же стиле, что и существующие) и список ДОПОЛНИТЕЛЬНЫХ полей, которые пригодятся для будущих записей такого рода (НЕ включай Дата/Время/Категория — они добавляются всегда автоматически). Верни {"new_category": "...", "fields": [{"name":"...","type":"text|number|date|select"}]}.
+Analyse the user's message and decide:
+1. If it clearly belongs to one of the existing categories, return {"existing_category": "<exact name from the list>"}.
+2. If it's a new kind of entry with no suitable category yet, propose a short English category name (no digits, same style as the existing ones) plus a list of ADDITIONAL fields useful for future entries of this kind. Do NOT include Logged Date, Logged Time, Event Date, Event Time, Category, Type or Note — those are always added automatically. Return {"new_category": "...", "fields": [{"name":"...","type":"text|number|date|select"}]}.
 
-Разрешённые типы полей: text, number, date, select.
-Верни ТОЛЬКО валидный JSON, без markdown, без пояснений.
+All field names must be in English. Allowed types: text, number, date, select.
+Return ONLY valid JSON, no markdown, no explanations.
 
-Сообщение пользователя: "${userText}"`;
+User message: "${userText}"`;
 
   return generateGeminiJSON(prompt);
 }
 
 async function reviseProposal(category, fields, correctionText) {
-  const prompt = `Ранее было предложено создать категорию "${category}" с полями:
+  const prompt = `A proposal was made to create category "${category}" with these fields:
 ${JSON.stringify(fields)}
 
-Пользователь прислал правку: "${correctionText}"
+The user replied with a correction: "${correctionText}"
 
-Учти эту правку (это может быть изменение названия категории, добавление/удаление/переименование полей, смена типа поля). Верни ТОЛЬКО валидный JSON, без markdown, в структуре:
+Apply that correction (it may rename the category, add/remove/rename fields, or change field types). All names must be in English. Return ONLY valid JSON, no markdown:
 {"category": "...", "fields": [{"name":"...","type":"text|number|date|select"}]}`;
 
   return generateGeminiJSON(prompt);
 }
 
 async function parseWithGemini(userText, ctx) {
-  const { schema, selectOptions, existingTitles, defaultDate, defaultTime, category } = ctx;
+  const { schema, selectOptions, existingTypes, loggedDate, loggedTime, category } = ctx;
 
   const schemaDescription =
     Object.entries(schema)
       .filter(([name]) => name !== "Name")
       .map(([name, type]) => {
         if (type === "select" && selectOptions[name] && selectOptions[name].length > 0) {
-          return `- ${name} (select, существующие варианты: ${selectOptions[name].join(", ")})`;
+          return `- ${name} (select, existing options: ${selectOptions[name].join(", ")})`;
         }
         return `- ${name} (${type})`;
       })
-      .join("\n") || "(пока пусто, полей ещё нет)";
+      .join("\n") || "(empty, no fields yet)";
 
-  const titlesDescription =
-    existingTitles.length > 0 ? existingTitles.map((t) => `"${t}"`).join(", ") : "(записей ещё нет)";
+  const typesDescription = existingTypes.length > 0 ? existingTypes.join(", ") : "(none yet)";
 
-  const prompt = `Ты — ассистент, который раскладывает свободный текст пользователя по полям базы данных для личного трекера.
+  const prompt = `You extract structured data from a user's free-form personal-tracking message.
 
-Сообщение отправлено: ${defaultDate}, время отправки: ${defaultTime} (часовой пояс Asia/Jerusalem).
-Категория этого сообщения: "${category}".
+Message was sent on ${loggedDate} at ${loggedTime} (timezone Asia/Jerusalem).
+Category of this message: "${category}".
 
-Уже существующие поля в базе:
+Existing fields in the database:
 ${schemaDescription}
 
-Уже использованные названия записей (поле Name): ${titlesDescription}
+Existing options of the "Type" field: ${typesDescription}
 
-ПРАВИЛА:
-1. "Дата" (date) — всегда дата отправки (${defaultDate}), если пользователь явно не указал другую.
-2. "Время" (text, HH:MM) — по умолчанию время отправки (${defaultTime}). Меняй только при явной привязке времени к событию. Голое число без привязки — это длительность или другая метрика, не время.
-3. "Категория" (select, значение всегда "${category}") — включай как обычное поле.
-4. "title" — короткое, без цифр. Если в списке названий есть подходящее — используй его точное написание.
-5. Для повторяющихся категориальных признаков используй select, переиспользуя существующие варианты дословно.
-6. Числовые метрики — number. Разрешённые типы: text, number, date, select.
-7. Верни ТОЛЬКО валидный JSON:
+RULES:
+
+1. "Logged Date" (date) = ${loggedDate} and "Logged Time" (text, HH:MM) = ${loggedTime}. ALWAYS these exact values — they record when the message was sent and must never be inferred from the text.
+
+2. "Event Date" (date) and "Event Time" (text, HH:MM) = when the thing actually happened. Default them to ${loggedDate} and ${loggedTime}. Override ONLY on an explicit signal in the text: a stated date ("yesterday", "on July 3rd", "last Monday") or a time explicitly tied to the event ("ate at 17:00", "log this at 9am"). A bare number or duration-looking value ("plank 6 minutes", "7:50") is NOT an event time — treat it as a duration or other metric in its own field, and keep Event Time at the sent time.
+
+3. "Type" (select) — a short concrete English label for the activity, NO DIGITS, usually one word or a short set phrase ("plank", "breakfast", "cycling", "leg workout", "groceries", "cafe"). This is the main grouping field, so if a suitable option already exists in the list above, reuse its EXACT spelling. Only invent a new option for a genuinely new kind of activity.
+
+4. "Note" (text) — leave it OUT entirely in the normal case. Include it ONLY when something was genuinely ambiguous or you had to guess: an unclear number, an assumed unit or currency, a date inferred from vague wording, or information you couldn't place in any field. Keep it to one short English sentence explaining the ambiguity, so the user learns to phrase things more precisely. Never use it for generic remarks like "parsed successfully".
+
+5. For other recurring categorical attributes use select as well, reusing existing options verbatim. Numeric metrics use number. Allowed types: text, number, date, select. All new field names must be in English.
+
+6. Return ONLY valid JSON, no markdown:
 
 {
-  "title": "короткое название без цифр",
   "properties": {
-    "Дата": { "type": "date", "value": "YYYY-MM-DD" },
-    "Время": { "type": "text", "value": "HH:MM" },
-    "Категория": { "type": "select", "value": "${category}" }
+    "Logged Date": { "type": "date", "value": "${loggedDate}" },
+    "Logged Time": { "type": "text", "value": "${loggedTime}" },
+    "Event Date": { "type": "date", "value": "YYYY-MM-DD" },
+    "Event Time": { "type": "text", "value": "HH:MM" },
+    "Category": { "type": "select", "value": "${category}" },
+    "Type": { "type": "select", "value": "short label without digits" }
   },
   "new_properties": [
-    { "name": "Название нового поля", "type": "text|number|date|select" }
+    { "name": "New field name", "type": "text|number|date|select" }
   ]
 }
 
-Сообщение пользователя: "${userText}"`;
+User message: "${userText}"`;
 
   return generateGeminiJSON(prompt);
 }
@@ -782,16 +761,23 @@ async function sendTelegramMessage(chatId, text) {
 }
 
 function buildConfirmationText(parsed, category) {
-  const lines = [`✅ Сохранил: ${parsed.title || "запись"} (${category})`];
+  const props = parsed.properties || {};
+  const typeValue = props["Type"] ? props["Type"].value : null;
 
-  for (const [name, field] of Object.entries(parsed.properties || {})) {
-    if (name === "Категория") continue;
+  const lines = [typeValue ? `✅ Saved: ${typeValue} (${category})` : `✅ Saved to "${category}"`];
+
+  for (const [name, field] of Object.entries(props)) {
+    if (["Category", "Type", "Logged Date", "Logged Time", "Note"].includes(name)) continue;
     lines.push(`• ${name}: ${field.value}`);
+  }
+
+  if (props["Note"] && props["Note"].value) {
+    lines.push(`\n⚠️ ${props["Note"].value}`);
   }
 
   if (parsed.new_properties && parsed.new_properties.length > 0) {
     const names = parsed.new_properties.map((p) => p.name).join(", ");
-    lines.push(`\n➕ Добавил новые поля в базу: ${names}`);
+    lines.push(`\n➕ Added new fields: ${names}`);
   }
 
   return lines.join("\n");
