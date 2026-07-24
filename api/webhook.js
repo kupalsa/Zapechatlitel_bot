@@ -88,7 +88,7 @@ module.exports = async (req, res) => {
     const fields = classification.fields || [];
 
     await setPendingProposal(chatId, category, fields, userText);
-    await sendTelegramMessage(chatId, buildProposalText(category, fields));
+    await sendProposalMessage(chatId, buildProposalText(category, fields));
 
     res.status(200).json({ ok: true });
   } catch (err) {
@@ -110,13 +110,13 @@ async function handlePendingResponse(pending, userText, chatId, loggedDate, logg
 
   if (CANCEL_RE.test(userText)) {
     await clearPendingProposal(chatId);
-    await sendTelegramMessage(chatId, "Okay, not creating it. Send the message again whenever you want.");
+    await sendTelegramMessageNoKeyboard(chatId, "Okay, not creating it. Send the message again whenever you want.");
     return;
   }
 
   const revised = await reviseProposal(pending.category, pending.fields, userText);
   await setPendingProposal(chatId, revised.category, revised.fields, pending.originalText);
-  await sendTelegramMessage(chatId, buildProposalText(revised.category, revised.fields, true));
+  await sendProposalMessage(chatId, buildProposalText(revised.category, revised.fields, true));
 }
 
 function buildProposalText(category, fields, isRevision) {
@@ -752,12 +752,32 @@ User message: "${userText}"`;
 
 // ---------- Telegram ----------
 
-async function sendTelegramMessage(chatId, text) {
+async function sendTelegramMessage(chatId, text, replyMarkup) {
+  const body = { chat_id: chatId, text };
+  if (replyMarkup) body.reply_markup = replyMarkup;
+
   await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: chatId, text }),
+    body: JSON.stringify(body),
   });
+}
+
+// Shows a "Yes" / "No" keyboard under the message while still allowing free
+// text — tapping a button just sends that text as a normal message, which
+// CONFIRM_RE / CANCEL_RE already handle. one_time_keyboard hides it after use.
+async function sendProposalMessage(chatId, text) {
+  await sendTelegramMessage(chatId, text, {
+    keyboard: [[{ text: "Yes" }], [{ text: "No" }]],
+    resize_keyboard: true,
+    one_time_keyboard: true,
+  });
+}
+
+// Explicitly clears the keyboard, e.g. after a cancel, in case Telegram
+// hasn't already hidden it.
+async function sendTelegramMessageNoKeyboard(chatId, text) {
+  await sendTelegramMessage(chatId, text, { remove_keyboard: true });
 }
 
 function buildConfirmationText(parsed, category) {
