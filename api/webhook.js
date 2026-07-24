@@ -24,7 +24,26 @@ const CORE_FIELDS = ["Name", "Logged Date", "Logged Time", "Event Date", "Event 
 // Cyrillic words. Confirmation must be the whole message, so that
 // "yes, but add a field" is treated as a correction instead.
 const CONFIRM_RE = /^\s*(yes|yep|yeah|ok|okay|sure|confirm|correct|create|go|да|ага|ок|окей|хорошо|создавай)\s*[!.]*\s*$/i;
-const CANCEL_RE = /^\s*(no|nope|cancel|stop|нет|отмена|стоп)\s*[!.]*\s*$/i;
+
+// A bare "no" (no extra detail) does NOT cancel — it just means "not quite
+// right", so we ask what to change instead of guessing or aborting.
+const BARE_NO_RE = /^\s*(no|nope|нет|неа)\s*[!.,]*\s*$/i;
+
+// Only explicit, unambiguous words actually cancel the proposal.
+const CANCEL_RE = /^\s*(cancel|stop|never ?mind|forget it|отмена|отменить|стоп)\s*[!.]*\s*$/i;
+
+// Strips a leading emoji/punctuation (from tapped keyboard buttons like
+// "✅ Yes") before matching the regexes above.
+function cleanUserInput(text) {
+  return text.replace(/^[^\p{L}\p{N}]+/u, "").trim();
+}
+
+function escapeHtml(str) {
+  return String(str)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
 
 module.exports = async (req, res) => {
   if (req.method !== "POST") {
@@ -47,10 +66,10 @@ module.exports = async (req, res) => {
     if (userText.startsWith("/start")) {
       await sendTelegramMessage(
         chatId,
-        "Hi! Just write freely about what you did.\n\n" +
-          "If the topic is new, I'll propose a database and fields for it and wait for your confirmation.\n" +
-          "If the topic already exists, I'll save the entry right away.\n\n" +
-          "Manual command: \"split <category>\" — moves entries with that Category value out of the legacy shared database into a dedicated one."
+        "👋 <b>Hi!</b> Just write freely about what you did.\n\n" +
+          "🆕 If the topic is new, I'll propose a database and fields for it and wait for your confirmation.\n" +
+          "✅ If the topic already exists, I'll save the entry right away.\n\n" +
+          "🔧 Manual command: <code>split &lt;category&gt;</code> — moves entries with that Category value out of the legacy shared database into a dedicated one."
       );
       res.status(200).json({ ok: true });
       return;
@@ -100,17 +119,26 @@ module.exports = async (req, res) => {
 // ---------- Pending proposal flow ----------
 
 async function handlePendingResponse(pending, userText, chatId, loggedDate, loggedTime) {
-  if (CONFIRM_RE.test(userText)) {
+  const cleaned = cleanUserInput(userText);
+
+  if (CONFIRM_RE.test(cleaned)) {
     const databaseId = await createCategoryDatabase(pending.category, pending.fields);
     await clearPendingProposal(chatId);
-    await sendTelegramMessage(chatId, `✅ Created database "${pending.category}". Saving the entry...`);
+    await sendTelegramMessage(chatId, `🛠️ Created database <b>"${escapeHtml(pending.category)}"</b>. Saving the entry...`);
     await saveEntry(pending.originalText, pending.category, databaseId, loggedDate, loggedTime, chatId);
     return;
   }
 
-  if (CANCEL_RE.test(userText)) {
+  if (CANCEL_RE.test(cleaned)) {
     await clearPendingProposal(chatId);
-    await sendTelegramMessageNoKeyboard(chatId, "Okay, not creating it. Send the message again whenever you want.");
+    await sendTelegramMessageNoKeyboard(chatId, "🚫 Okay, not creating it. Send the message again whenever you want.");
+    return;
+  }
+
+  if (BARE_NO_RE.test(cleaned)) {
+    // Not a cancel — just means "not quite right". Keep the proposal pending
+    // and ask what to change, instead of guessing or aborting.
+    await sendTelegramMessage(chatId, "🤔 No problem — what would you like me to change?");
     return;
   }
 
@@ -122,20 +150,24 @@ async function handlePendingResponse(pending, userText, chatId, loggedDate, logg
 function buildProposalText(category, fields, isRevision) {
   const lines = [
     isRevision
-      ? `Updated proposal. Category: "${category}"`
-      : `You don't have a database for "${category}" yet. Suggested extra fields:`,
+      ? `✏️ <b>Updated proposal</b> — category: "${escapeHtml(category)}"`
+      : `🆕 No database for <b>"${escapeHtml(category)}"</b> yet.`,
+    "",
+    "📋 <b>Suggested fields:</b>",
   ];
 
   if (!fields || fields.length === 0) {
-    lines.push("(no extra fields needed — core fields only)");
+    lines.push("<i>(no extra fields needed — core fields only)</i>");
   } else {
     for (const f of fields) {
-      lines.push(`• ${f.name} (${f.type})`);
+      lines.push(`• <b>${escapeHtml(f.name)}</b> <i>(${escapeHtml(f.type)})</i>`);
     }
   }
 
-  lines.push("(Logged Date/Time, Event Date/Time, Category, Type and Note are added automatically)");
-  lines.push('\nLooks right? Reply "yes" to create it, or tell me what to change.');
+  lines.push("");
+  lines.push("<i>Logged Date/Time, Event Date/Time, Category, Type and Note are added automatically.</i>");
+  lines.push("");
+  lines.push("❓ <b>Yes</b> to create it, <b>No</b> to edit it, or <b>Cancel</b> to drop it.");
 
   return lines.join("\n");
 }
@@ -434,17 +466,17 @@ function parseSplitCommand(text) {
 
 async function performSplit(category, chatId) {
   if (!NOTION_PARENT_PAGE_ID || !NOTION_DATABASE_ID) {
-    await sendTelegramMessage(chatId, "NOTION_PARENT_PAGE_ID / NOTION_DATABASE_ID are not configured.");
+    await sendTelegramMessage(chatId, "⚠️ NOTION_PARENT_PAGE_ID / NOTION_DATABASE_ID are not configured.");
     return;
   }
 
   const existingDbId = await resolveDatabaseForCategory(category);
   if (existingDbId) {
-    await sendTelegramMessage(chatId, `A database for "${category}" already exists — new entries go there already.`);
+    await sendTelegramMessage(chatId, `ℹ️ A database for <b>"${escapeHtml(category)}"</b> already exists — new entries go there already.`);
     return;
   }
 
-  await sendTelegramMessage(chatId, `Looking for "${category}" entries in the legacy database and moving them...`);
+  await sendTelegramMessage(chatId, `🔍 Looking for <b>"${escapeHtml(category)}"</b> entries in the legacy database and moving them...`);
 
   const { schema } = await getNotionSchemaAndOptions(NOTION_DATABASE_ID);
   const extraFields = Object.entries(schema)
@@ -508,7 +540,7 @@ async function performSplit(category, chatId) {
     }
   }
 
-  await sendTelegramMessage(chatId, `✅ Moved ${moved} "${category}" entries into the new database.`);
+  await sendTelegramMessage(chatId, `✅ Moved <b>${moved}</b> "${escapeHtml(category)}" entries into the new database.`);
 }
 
 // ---------- Bot State (pending proposals) ----------
@@ -753,7 +785,7 @@ User message: "${userText}"`;
 // ---------- Telegram ----------
 
 async function sendTelegramMessage(chatId, text, replyMarkup) {
-  const body = { chat_id: chatId, text };
+  const body = { chat_id: chatId, text, parse_mode: "HTML" };
   if (replyMarkup) body.reply_markup = replyMarkup;
 
   await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
@@ -763,12 +795,13 @@ async function sendTelegramMessage(chatId, text, replyMarkup) {
   });
 }
 
-// Shows a "Yes" / "No" keyboard under the message while still allowing free
-// text — tapping a button just sends that text as a normal message, which
-// CONFIRM_RE / CANCEL_RE already handle. one_time_keyboard hides it after use.
+// Shows a Yes / No / Cancel keyboard under the message while still allowing
+// free text — tapping a button just sends its label as a normal message,
+// which CONFIRM_RE / BARE_NO_RE / CANCEL_RE handle (after cleanUserInput
+// strips the emoji). one_time_keyboard hides it after use.
 async function sendProposalMessage(chatId, text) {
   await sendTelegramMessage(chatId, text, {
-    keyboard: [[{ text: "Yes" }], [{ text: "No" }]],
+    keyboard: [[{ text: "✅ Yes" }, { text: "✏️ No" }, { text: "❌ Cancel" }]],
     resize_keyboard: true,
     one_time_keyboard: true,
   });
@@ -784,20 +817,27 @@ function buildConfirmationText(parsed, category) {
   const props = parsed.properties || {};
   const typeValue = props["Type"] ? props["Type"].value : null;
 
-  const lines = [typeValue ? `✅ Saved: ${typeValue} (${category})` : `✅ Saved to "${category}"`];
+  const lines = [
+    typeValue
+      ? `✅ <b>Saved:</b> ${escapeHtml(typeValue)} <i>(${escapeHtml(category)})</i>`
+      : `✅ <b>Saved to</b> "${escapeHtml(category)}"`,
+    "",
+  ];
 
   for (const [name, field] of Object.entries(props)) {
     if (["Category", "Type", "Logged Date", "Logged Time", "Note"].includes(name)) continue;
-    lines.push(`• ${name}: ${field.value}`);
+    lines.push(`• <b>${escapeHtml(name)}:</b> ${escapeHtml(field.value)}`);
   }
 
   if (props["Note"] && props["Note"].value) {
-    lines.push(`\n⚠️ ${props["Note"].value}`);
+    lines.push("");
+    lines.push(`⚠️ <i>${escapeHtml(props["Note"].value)}</i>`);
   }
 
   if (parsed.new_properties && parsed.new_properties.length > 0) {
-    const names = parsed.new_properties.map((p) => p.name).join(", ");
-    lines.push(`\n➕ Added new fields: ${names}`);
+    const names = parsed.new_properties.map((p) => escapeHtml(p.name)).join(", ");
+    lines.push("");
+    lines.push(`➕ <b>Added new fields:</b> ${names}`);
   }
 
   return lines.join("\n");
