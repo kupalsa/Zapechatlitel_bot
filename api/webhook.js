@@ -7,7 +7,7 @@
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-flash-latest";
 const NOTION_API_KEY = process.env.NOTION_API_KEY;
 const NOTION_DATABASE_ID = process.env.NOTION_DATABASE_ID;
 
@@ -28,7 +28,6 @@ module.exports = async (req, res) => {
     const message = update.message;
 
     if (!message || !message.text) {
-      // Игнорируем не-текстовые апдейты (стикеры, голосовые пока не обрабатываем и т.п.)
       res.status(200).json({ ok: true });
       return;
     }
@@ -45,28 +44,37 @@ module.exports = async (req, res) => {
       return;
     }
 
-    // 1. Забираем текущую схему базы (какие поля уже есть)
     const schema = await getNotionSchema();
-
-    // 2. Просим Gemini разобрать сообщение с учётом текущей схемы
     const parsed = await parseWithGemini(userText, schema);
 
-    // 3. Если Gemini предложил новые поля — добавляем их в базу
-    if (parsed.new_properties && parsed.new_properties.length > 0) {
-      await addPropertiesToDatabase(parsed.new_properties, schema);
+    const propsToAdd = [];
+    const seen = new Set();
+
+    for (const [name, field] of Object.entries(parsed.properties || {})) {
+      if (!schema[name] && !seen.has(name)) {
+        propsToAdd.push({ name, type: field.type });
+        seen.add(name);
+      }
+    }
+    for (const p of parsed.new_properties || []) {
+      if (!schema[p.name] && !seen.has(p.name)) {
+        propsToAdd.push(p);
+        seen.add(p.name);
+      }
     }
 
-    // 4. Создаём запись в Notion
+    if (propsToAdd.length > 0) {
+      await addPropertiesToDatabase(propsToAdd, schema);
+    }
+
     await createNotionPage(parsed);
 
-    // 5. Отвечаем пользователю подтверждением
     const summary = buildConfirmationText(parsed);
     await sendTelegramMessage(chatId, summary);
 
     res.status(200).json({ ok: true });
   } catch (err) {
     console.error("Webhook error:", err);
-    // Telegram ждёт 200 даже при ошибке, иначе будет ретраить бесконечно
     res.status(200).json({ ok: false, error: String(err) });
   }
 };
@@ -95,7 +103,7 @@ async function getNotionSchema() {
     properties[name] = mapNotionTypeToSimple(prop.type);
   }
 
-  return properties; // { "Длительность_мин": "number", "Категория": "select", ... }
+  return properties;
 }
 
 function mapNotionTypeToSimple(notionType) {
@@ -103,15 +111,15 @@ function mapNotionTypeToSimple(notionType) {
   if (notionType === "number") return "number";
   if (notionType === "date") return "date";
   if (notionType === "select") return "select";
-  return "text"; // fallback для неизвестных типов
+  return "text";
 }
 
 async function addPropertiesToDatabase(newProperties, existingSchema) {
   const propertiesPatch = {};
 
   for (const prop of newProperties) {
-    if (existingSchema[prop.name]) continue; // уже есть, пропускаем
-    if (!ALLOWED_TYPES.includes(prop.type)) continue; // неизвестный тип, пропускаем
+    if (existingSchema[prop.name]) continue;
+    if (!ALLOWED_TYPES.includes(prop.type)) continue;
 
     propertiesPatch[prop.name] = buildNotionPropertySchema(prop.type);
   }
@@ -152,8 +160,6 @@ function buildNotionPropertySchema(type) {
 
 async function createNotionPage(parsed) {
   const properties = {
-    // Первое (title) поле в Notion базе должно называться так же, как в твоей базе.
-    // По умолчанию Notion называет его "Name" — поменяй здесь, если у тебя иначе.
     Name: {
       title: [{ text: { content: parsed.title || "Запись" } }],
     },
@@ -199,7 +205,7 @@ function buildNotionPropertyValue(type, value) {
 // ---------- Gemini ----------
 
 async function parseWithGemini(userText, schema) {
-  const today = new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Jerusalem" }); // YYYY-MM-DD
+  const today = new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Jerusalem" });
 
   const schemaDescription = Object.entries(schema)
     .filter(([name]) => name !== "Name")
